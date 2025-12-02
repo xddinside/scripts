@@ -1,0 +1,95 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+### CONFIG
+MUSIC_DIR="$HOME/Music"
+SOCKET="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/mpvsocket"
+LOG="/tmp/flacmenu.log"
+ALBUMART_CACHE="$HOME/.cache/albumart"
+
+MPV="$(command -v mpv || true)"
+FZF="$(command -v fzf || true)"
+SOCAT="$(command -v socat || true)"
+UEBERZUGPP="$(command -v ueberzugpp || true)"
+FFMPEG="$(command -v ffmpeg || true)"
+MEDIAINFO="$(command -v mediainfo || true)"
+HYPRCTL="$(command -v hyprctl || true)"
+
+mkdir -p "$ALBUMART_CACHE"
+
+{
+  echo
+  echo "====== flacmenu $(date) ======"
+  echo "Music dir: $MUSIC_DIR"
+  echo "Socket: $SOCKET"
+} >> "$LOG"
+
+cd "$MUSIC_DIR"
+
+### ============================
+### RUN FZF (MULTI SELECT)
+### ============================
+
+TRACKS=$(find . -type f \( -iname "*.flac" -o -iname "*.wav" \) | sed 's|^\./||')
+
+if [ -z "$TRACKS" ]; then
+  echo "No tracks found." >> "$LOG"
+  exit 0
+fi
+
+FILE_REL="$(
+  printf '%s\n' "$TRACKS" |
+  sed 's|^|🎵 |' |
+  "$FZF" --height=90% --border=rounded --margin=1,2 --padding=1,2 \
+        --prompt="Select tracks (TAB to multi-select) > " \
+        --multi \
+        --layout=reverse \
+        --bind='tab:toggle+down' \
+        --ansi
+)"
+
+if [ -z "${FILE_REL:-}" ]; then
+  echo "Nothing selected." >> "$LOG"
+  exit 0
+fi
+
+IFS=$'\n' read -rd '' -a SELECTED_ARRAY < <(printf '%s\n' "$FILE_REL" && printf '\0')
+
+ABS_LIST=()
+for item in "${SELECTED_ARRAY[@]}"; do
+  cleaned="${item#🎵 }"
+  cleaned="${cleaned#./}"
+  ABS_LIST+=("$MUSIC_DIR/$cleaned")
+done
+
+### ============================
+### APPEND OR LAUNCH MPV
+### ============================
+
+# append if mpv running
+if pgrep -x mpv >/dev/null 2>&1 && [ -S "$SOCKET" ] && [ -n "$SOCAT" ]; then
+  for p in "${ABS_LIST[@]}"; do
+    printf 'loadfile "%s" append-play\n' "$p" | $SOCAT - "$SOCKET"
+  done
+  exit 0
+fi
+
+# otherwise launch mpv with playlist
+PLAYLIST="/tmp/flacmenu_playlist_$$.m3u"
+: > "$PLAYLIST"
+for p in "${ABS_LIST[@]}"; do
+  echo "$p" >> "$PLAYLIST"
+done
+
+CMD="$MPV --no-terminal --input-ipc-server=$SOCKET --playlist=$PLAYLIST"
+
+if [ -n "$HYPRCTL" ]; then
+  hyprctl dispatch exec "$CMD" || {
+    nohup setsid $CMD >/tmp/mpv-flacmenu.out 2>/tmp/mpv-flacmenu.err &
+  }
+else
+  nohup setsid $CMD >/tmp/mpv-flacmenu.out 2>/tmp/mpv-flacmenu.err &
+fi
+
+exit 0
+
