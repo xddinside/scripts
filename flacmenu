@@ -27,69 +27,144 @@ mkdir -p "$ALBUMART_CACHE"
 cd "$MUSIC_DIR"
 
 ### ============================
-### RUN FZF (MULTI SELECT)
+### HELPER FUNCTIONS
 ### ============================
 
-TRACKS=$(find . -type f \( -iname "*.flac" -o -iname "*.wav" \) | sed 's|^\./||')
+select_mode() {
+  printf '%s\n' "📀 Albums" "🎵 Songs" | \
+    "$FZF" --height=90% --border=rounded --margin=1,2 --padding=1,2 \
+           --prompt="Select mode > " \
+           --layout=reverse \
+           --ansi
+}
 
-if [ -z "$TRACKS" ]; then
-  echo "No tracks found." >> "$LOG"
-  exit 0
-fi
+select_album() {
+  # List directories only, sorted by modification time (newest first)
+  find . -maxdepth 1 -type d ! -name '.' -printf '%T@ %f\n' | \
+    sort -rn | \
+    cut -d' ' -f2- | \
+    "$FZF" --height=90% --border=rounded --margin=1,2 --padding=1,2 \
+           --prompt="Select album > " \
+           --layout=reverse \
+           --ansi
+}
 
-FILE_REL="$(
-  printf '%s\n' "$TRACKS" |
-  sed 's|^|🎵 |' |
-  "$FZF" --height=90% --border=rounded --margin=1,2 --padding=1,2 \
-        --prompt="Select tracks (TAB to multi-select) > " \
-        --multi \
-        --layout=reverse \
-        --bind='tab:toggle+down' \
-        --ansi
-)"
+select_songs_from_album() {
+  local album="$1"
+  # List tracks in album, sorted by filename
+  find "$album" -maxdepth 1 -type f \( -iname "*.flac" -o -iname "*.wav" \) -printf '%f\n' | \
+    sort | \
+    sed 's|^|🎵 |' | \
+    "$FZF" --height=90% --border=rounded --margin=1,2 --padding=1,2 \
+           --prompt="Select tracks (TAB to multi-select) > " \
+           --multi \
+           --layout=reverse \
+           --bind='tab:toggle+down' \
+           --ansi
+}
 
-if [ -z "${FILE_REL:-}" ]; then
+play_or_queue() {
+  local -a tracks=("$@")
+  
+  # append if mpv running
+  if pgrep -x mpv >/dev/null 2>&1 && [ -S "$SOCKET" ] && [ -n "$SOCAT" ]; then
+    for p in "${tracks[@]}"; do
+      printf 'loadfile "%s" append-play\n' "$p" | $SOCAT - "$SOCKET"
+    done
+    exit 0
+  fi
+
+  # otherwise launch mpv with playlist
+  PLAYLIST="/tmp/flacmenu_playlist_$$.m3u"
+  : > "$PLAYLIST"
+  for p in "${tracks[@]}"; do
+    echo "$p" >> "$PLAYLIST"
+  done
+
+  CMD="$MPV --no-terminal --input-ipc-server=$SOCKET --playlist=$PLAYLIST"
+
+  if [ -n "$HYPRCTL" ]; then
+    hyprctl dispatch exec "$CMD" || {
+      nohup setsid $CMD >/tmp/mpv-flacmenu.out 2>/tmp/mpv-flacmenu.err &
+    }
+  else
+    nohup setsid $CMD >/tmp/mpv-flacmenu.out 2>/tmp/mpv-flacmenu.err &
+  fi
+}
+
+### ============================
+### MAIN FLOW
+### ============================
+
+# Step 1: Select mode (Albums or Songs)
+MODE=$(select_mode)
+
+if [ -z "${MODE:-}" ]; then
   echo "Nothing selected." >> "$LOG"
   exit 0
 fi
 
-IFS=$'\n' read -rd '' -a SELECTED_ARRAY < <(printf '%s\n' "$FILE_REL" && printf '\0')
-
-ABS_LIST=()
-for item in "${SELECTED_ARRAY[@]}"; do
-  cleaned="${item#🎵 }"
-  cleaned="${cleaned#./}"
-  ABS_LIST+=("$MUSIC_DIR/$cleaned")
-done
-
-### ============================
-### APPEND OR LAUNCH MPV
-### ============================
-
-# append if mpv running
-if pgrep -x mpv >/dev/null 2>&1 && [ -S "$SOCKET" ] && [ -n "$SOCAT" ]; then
-  for p in "${ABS_LIST[@]}"; do
-    printf 'loadfile "%s" append-play\n' "$p" | $SOCAT - "$SOCKET"
-  done
-  exit 0
-fi
-
-# otherwise launch mpv with playlist
-PLAYLIST="/tmp/flacmenu_playlist_$$.m3u"
-: > "$PLAYLIST"
-for p in "${ABS_LIST[@]}"; do
-  echo "$p" >> "$PLAYLIST"
-done
-
-CMD="$MPV --no-terminal --input-ipc-server=$SOCKET --playlist=$PLAYLIST"
-
-if [ -n "$HYPRCTL" ]; then
-  hyprctl dispatch exec "$CMD" || {
-    nohup setsid $CMD >/tmp/mpv-flacmenu.out 2>/tmp/mpv-flacmenu.err &
-  }
-else
-  nohup setsid $CMD >/tmp/mpv-flacmenu.out 2>/tmp/mpv-flacmenu.err &
-fi
+case "$MODE" in
+  "📀 Albums")
+    # Step 2a: Select an album
+    ALBUM=$(select_album)
+    
+    if [ -z "${ALBUM:-}" ]; then
+      echo "No album selected." >> "$LOG"
+      exit 0
+    fi
+    
+    # Step 3a: Get all tracks in album, sorted by filename
+    mapfile -t TRACKS < <(find "$ALBUM" -maxdepth 1 -type f \( -iname "*.flac" -o -iname "*.wav" \) -printf '%f\n' | sort)
+    
+    if [ ${#TRACKS[@]} -eq 0 ]; then
+      echo "No tracks found in album." >> "$LOG"
+      exit 0
+    fi
+    
+    # Build absolute paths
+    ABS_LIST=()
+    for track in "${TRACKS[@]}"; do
+      ABS_LIST+=("$MUSIC_DIR/$ALBUM/$track")
+    done
+    
+    play_or_queue "${ABS_LIST[@]}"
+    ;;
+    
+  "🎵 Songs")
+    # Step 2b: Select an album first
+    ALBUM=$(select_album)
+    
+    if [ -z "${ALBUM:-}" ]; then
+      echo "No album selected." >> "$LOG"
+      exit 0
+    fi
+    
+    # Step 3b: Select songs from that album (multi-select)
+    SELECTED=$(select_songs_from_album "$ALBUM")
+    
+    if [ -z "${SELECTED:-}" ]; then
+      echo "No songs selected." >> "$LOG"
+      exit 0
+    fi
+    
+    # Parse selection and build absolute paths
+    IFS=$'\n' read -rd '' -a SELECTED_ARRAY < <(printf '%s\n' "$SELECTED" && printf '\0')
+    
+    ABS_LIST=()
+    for item in "${SELECTED_ARRAY[@]}"; do
+      # Remove the emoji prefix
+      cleaned="${item#🎵 }"
+      ABS_LIST+=("$MUSIC_DIR/$ALBUM/$cleaned")
+    done
+    
+    play_or_queue "${ABS_LIST[@]}"
+    ;;
+    
+  *)
+    echo "Invalid mode selected." >> "$LOG"
+    exit 1
+    ;;
+esac
 
 exit 0
-
