@@ -1,12 +1,35 @@
 #!/bin/bash
-# Check if bootdev is running already
-if hyprctl clients | grep -q "boot.dev"; then
-    # If running, toggle the special workspace
+
+CLASS="chrome-boot.dev__-Default"
+WORKSPACE="special:bootdev"
+URL="https://boot.dev/"
+
+# Get window address by class
+get_window_addr() {
+    hyprctl clients -j | jq -r ".[] | select(.class == \"$CLASS\") | .address" | head -n1
+}
+
+window_addr=$(get_window_addr)
+
+if [[ -n "$window_addr" ]]; then
+    # Window exists, toggle the special workspace
     hyprctl dispatch togglespecialworkspace bootdev
 else
-    # If not running, launch it
-    chromium --new-window --app="https://boot.dev/" --class=Chromium-bootdev &
-    sleep 1
-    # Move to special workspace after launch
-    hyprctl dispatch movetoworkspace special:bootdev
+    # Launch the webapp
+    chromium --new-window --app="$URL" &
+    
+    # Wait for window to appear (poll instead of fixed sleep)
+    for i in {1..50}; do
+        sleep 0.1
+        window_addr=$(get_window_addr)
+        if [[ -n "$window_addr" ]]; then
+            break
+        fi
+    done
+    
+    # Move only this specific window to the special workspace
+    if [[ -n "$window_addr" ]]; then
+        hyprctl dispatch movetoworkspacesilent "$WORKSPACE,address:$window_addr"
+        hyprctl dispatch togglespecialworkspace bootdev
+    fi
 fi

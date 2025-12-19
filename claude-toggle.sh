@@ -1,13 +1,35 @@
 #!/bin/bash
 
-# Check if Claude is already running
-if hyprctl clients | grep -q "claude"; then
-    # If running, toggle the special workspace
+CLASS="chrome-claude.ai__-Default"
+WORKSPACE="special:claude"
+URL="https://claude.ai/"
+
+# Get window address by class
+get_window_addr() {
+    hyprctl clients -j | jq -r ".[] | select(.class == \"$CLASS\") | .address" | head -n1
+}
+
+window_addr=$(get_window_addr)
+
+if [[ -n "$window_addr" ]]; then
+    # Window exists, toggle the special workspace
     hyprctl dispatch togglespecialworkspace claude
 else
-    # If not running, launch it
-    chromium --new-window --app="https://claude.ai/" --class=Chromium-claude &
-    sleep 1
-    # Move to special workspace after launch
-    hyprctl dispatch movetoworkspace special:claude
+    # Launch the webapp
+    chromium --new-window --app="$URL" &
+    
+    # Wait for window to appear (poll instead of fixed sleep)
+    for i in {1..50}; do
+        sleep 0.1
+        window_addr=$(get_window_addr)
+        if [[ -n "$window_addr" ]]; then
+            break
+        fi
+    done
+    
+    # Move only this specific window to the special workspace
+    if [[ -n "$window_addr" ]]; then
+        hyprctl dispatch movetoworkspacesilent "$WORKSPACE,address:$window_addr"
+        hyprctl dispatch togglespecialworkspace claude
+    fi
 fi
