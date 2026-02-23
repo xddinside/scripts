@@ -2,21 +2,870 @@
 set -euo pipefail
 
 ### CONFIG
-MUSIC_DIR="$HOME/Music"
-SOCKET="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/mpvsocket"
-LOG="/tmp/flacmenu.log"
-ALBUMART_CACHE="$HOME/.cache/albumart"
+MUSIC_DIR="${MUSIC_DIR:-$HOME/Music}"
+SOCKET="${SOCKET:-${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/mpvsocket}"
+LOG="${FLACMENU_LOG:-/tmp/flacmenu.log}"
+CAELESTIA_SCHEME="${XDG_STATE_HOME:-$HOME/.local/state}/caelestia/scheme.json"
+UI_VARIANT="${FLACMENU_UI_VARIANT:-high}"
 
 MPV="$(command -v mpv || true)"
 FZF="$(command -v fzf || true)"
 SOCAT="$(command -v socat || true)"
-UEBERZUGPP="$(command -v ueberzugpp || true)"
-FFMPEG="$(command -v ffmpeg || true)"
 MEDIAINFO="$(command -v mediainfo || true)"
 HYPRCTL="$(command -v hyprctl || true)"
+JQ="$(command -v jq || true)"
 
-mkdir -p "$ALBUMART_CACHE"
+SCRIPT_PATH="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)/$(basename -- "${BASH_SOURCE[0]}")"
+export FLACMENU_SCRIPT="$SCRIPT_PATH"
 
+log_msg() {
+  printf '[%(%F %T)T] %s\n' -1 "$*" >> "$LOG" 2>/dev/null || true
+}
+
+die() {
+  printf 'flacmenu: %s\n' "$*" >&2
+  log_msg "ERROR: $*"
+  exit 1
+}
+
+require_cmd() {
+  local bin_path="$1"
+  local bin_name="$2"
+  [[ -n "$bin_path" ]] || die "Missing dependency: $bin_name"
+}
+
+# Global selections file for persistent multi-album track selection.
+OWN_SELECTIONS_FILE=0
+if [[ -n "${GLOBAL_SELECTIONS_FILE:-}" ]]; then
+  OWN_SELECTIONS_FILE=0
+else
+  GLOBAL_SELECTIONS_FILE="$(mktemp -t flacmenu-selections.XXXXXX)"
+  [[ -n "$GLOBAL_SELECTIONS_FILE" ]] || die "Failed to create selection tempfile"
+  OWN_SELECTIONS_FILE=1
+fi
+export GLOBAL_SELECTIONS_FILE
+
+cleanup() {
+  if [[ "$OWN_SELECTIONS_FILE" -eq 1 ]]; then
+    rm -f "$GLOBAL_SELECTIONS_FILE"
+  fi
+}
+trap cleanup EXIT INT TERM
+
+### ============================
+### CAELESTIA COLOR INTEGRATION
+### ============================
+
+# Default fallback colors (Material dark theme)
+declare -A COLORS=(
+  [bg]="#141318"
+  [fg]="#e6e1e9"
+  [primary]="#cbbeff"
+  [secondary]="#cac3dc"
+  [tertiary]="#edb8cc"
+  [surface]="#201f24"
+  [surfaceHigh]="#2b292f"
+  [surfaceHighest]="#36343a"
+  [onSurface]="#e6e1e9"
+  [onSurfaceVariant]="#c9c4d0"
+  [outline]="#938f99"
+  [error]="#ffb4ab"
+  [success]="#93e5b6"
+  [mauve]="#bfb8ff"
+  [pink]="#e2d7ff"
+  [green]="#c8e3ff"
+  [yellow]="#ffecf3"
+  [blue]="#b0b8ff"
+)
+
+load_caelestia_colors() {
+  if [[ -f "$CAELESTIA_SCHEME" ]] && [[ -n "$JQ" ]]; then
+    jq_color_or_default() {
+      local key="$1"
+      local fallback="$2"
+      local value
+      value=$("$JQ" -r ".colours.${key} // \"${fallback}\"" "$CAELESTIA_SCHEME" 2>/dev/null || true)
+      [[ "$value" =~ ^[0-9A-Fa-f]{6,8}$ ]] || value="$fallback"
+      printf '%s' "$value"
+    }
+
+    COLORS[bg]="#$(jq_color_or_default surface 141318)"
+    COLORS[fg]="#$(jq_color_or_default onSurface e6e1e9)"
+    COLORS[primary]="#$(jq_color_or_default primary cbbeff)"
+    COLORS[secondary]="#$(jq_color_or_default secondary cac3dc)"
+    COLORS[tertiary]="#$(jq_color_or_default tertiary edb8cc)"
+    COLORS[surface]="#$(jq_color_or_default surfaceContainer 201f24)"
+    COLORS[surfaceHigh]="#$(jq_color_or_default surfaceContainerHigh 2b292f)"
+    COLORS[surfaceHighest]="#$(jq_color_or_default surfaceContainerHighest 36343a)"
+    COLORS[onSurface]="#$(jq_color_or_default onSurface e6e1e9)"
+    COLORS[onSurfaceVariant]="#$(jq_color_or_default onSurfaceVariant c9c4d0)"
+    COLORS[outline]="#$(jq_color_or_default outline 938f99)"
+    COLORS[error]="#$(jq_color_or_default error ffb4ab)"
+    COLORS[success]="#$(jq_color_or_default green 93e5b6)"
+    COLORS[mauve]="#$(jq_color_or_default mauve bfb8ff)"
+    COLORS[pink]="#$(jq_color_or_default pink e2d7ff)"
+    COLORS[green]="#$(jq_color_or_default green c8e3ff)"
+    COLORS[yellow]="#$(jq_color_or_default yellow ffecf3)"
+    COLORS[blue]="#$(jq_color_or_default blue b0b8ff)"
+
+    log_msg "Loaded Caelestia colors from $CAELESTIA_SCHEME"
+  else
+    log_msg "Using fallback colors (Caelestia scheme not found or jq not available)"
+  fi
+}
+
+normalize_ui_variant() {
+  local v
+  v=$(printf '%s' "$UI_VARIANT" | tr '[:upper:]' '[:lower:]')
+  case "$v" in
+    high|high-contrast|contrast)
+      UI_VARIANT="high"
+      ;;
+    quiet|soft|muted)
+      UI_VARIANT="quiet"
+      ;;
+    *)
+      UI_VARIANT="high"
+      ;;
+  esac
+}
+
+apply_ui_variant() {
+  case "$UI_VARIANT" in
+    quiet)
+      # Soften accent colors for a calmer presentation.
+      COLORS[primary]="${COLORS[secondary]}"
+      COLORS[tertiary]="${COLORS[onSurfaceVariant]}"
+      COLORS[success]="${COLORS[secondary]}"
+      COLORS[blue]="${COLORS[secondary]}"
+      COLORS[yellow]="${COLORS[secondary]}"
+      ;;
+  esac
+}
+
+# Build fzf color string from Caelestia colors
+build_fzf_colors() {
+  if [[ "$UI_VARIANT" == "quiet" ]]; then
+    echo "bg:${COLORS[surface]},\
+bg+:${COLORS[surfaceHigh]},\
+fg:${COLORS[onSurfaceVariant]},\
+fg+:${COLORS[onSurface]},\
+hl:${COLORS[secondary]},\
+hl+:${COLORS[secondary]},\
+info:${COLORS[onSurfaceVariant]},\
+prompt:${COLORS[secondary]},\
+pointer:${COLORS[secondary]},\
+marker:${COLORS[secondary]},\
+spinner:${COLORS[secondary]},\
+header:${COLORS[secondary]},\
+border:${COLORS[outline]},\
+label:${COLORS[onSurfaceVariant]},\
+query:${COLORS[onSurface]},\
+gutter:${COLORS[surface]},\
+preview-bg:${COLORS[bg]},\
+preview-fg:${COLORS[onSurfaceVariant]}"
+  else
+    echo "bg:${COLORS[bg]},\
+bg+:${COLORS[surfaceHighest]},\
+fg:${COLORS[onSurface]},\
+fg+:${COLORS[fg]}:bold,\
+hl:${COLORS[primary]}:bold,\
+hl+:${COLORS[tertiary]}:bold,\
+info:${COLORS[secondary]}:bold,\
+prompt:${COLORS[primary]}:bold,\
+pointer:${COLORS[primary]}:bold,\
+marker:${COLORS[success]}:bold,\
+spinner:${COLORS[mauve]}:bold,\
+header:${COLORS[secondary]}:bold,\
+border:${COLORS[outline]},\
+label:${COLORS[tertiary]}:bold,\
+query:${COLORS[fg]},\
+gutter:${COLORS[surface]},\
+preview-bg:${COLORS[surfaceHigh]},\
+preview-fg:${COLORS[onSurface]}"
+  fi
+}
+
+# Load colors on startup
+normalize_ui_variant
+load_caelestia_colors
+apply_ui_variant
+FZF_COLORS=$(build_fzf_colors)
+
+hex_to_rgb() {
+  local hex="${1#\#}"
+  if [[ "$hex" =~ ^[0-9A-Fa-f]{8}$ ]]; then
+    hex="${hex:0:6}"
+  fi
+  if [[ ! "$hex" =~ ^[0-9A-Fa-f]{6}$ ]]; then
+    printf '255;255;255'
+    return 1
+  fi
+  printf '%d;%d;%d' "$((16#${hex:0:2}))" "$((16#${hex:2:2}))" "$((16#${hex:4:2}))"
+}
+
+ansi_fg() {
+  printf '\033[38;2;%sm' "$(hex_to_rgb "$1")"
+}
+
+ANSI_RESET=$'\033[0m'
+ANSI_BOLD=$'\033[1m'
+ANSI_DIM=$'\033[2m'
+C_PRIMARY=$(ansi_fg "${COLORS[primary]}")
+C_SECONDARY=$(ansi_fg "${COLORS[secondary]}")
+C_TERTIARY=$(ansi_fg "${COLORS[tertiary]}")
+C_SUCCESS=$(ansi_fg "${COLORS[success]}")
+C_ERROR=$(ansi_fg "${COLORS[error]}")
+C_FG=$(ansi_fg "${COLORS[fg]}")
+C_MUTED=$(ansi_fg "${COLORS[onSurfaceVariant]}")
+C_OUTLINE=$(ansi_fg "${COLORS[outline]}")
+C_BLUE=$(ansi_fg "${COLORS[blue]}")
+C_YELLOW=$(ansi_fg "${COLORS[yellow]}")
+UI_LABEL="HIGH CONTRAST"
+[[ "$UI_VARIANT" == "quiet" ]] && UI_LABEL="QUIET"
+
+### ============================
+### SELECTION MANAGEMENT
+### ============================
+
+line_has_prefix() {
+  local line="$1"
+  local prefix="$2"
+  [[ "$line" == "$prefix"* ]]
+}
+
+# Get track basenames from global selection that belong to a specific album
+get_album_selections() {
+  local album="$1"
+  local prefix="$MUSIC_DIR/$album/"
+  if [[ -s "$GLOBAL_SELECTIONS_FILE" ]]; then
+    while IFS= read -r line; do
+      if line_has_prefix "$line" "$prefix"; then
+        printf '%s\n' "${line#"$prefix"}"
+      fi
+    done < "$GLOBAL_SELECTIONS_FILE"
+  fi
+}
+
+# Sync selections: remove old album entries, add new ones
+sync_album_selections() {
+  local album="$1"
+  shift
+  local -a new_tracks=("$@")
+  local prefix="$MUSIC_DIR/$album/"
+  
+  # Remove all entries for this album
+  local tmp
+  tmp="$(mktemp -t flacmenu-sync.XXXXXX)" || die "Failed to create sync tempfile"
+  if [[ -s "$GLOBAL_SELECTIONS_FILE" ]]; then
+    while IFS= read -r line; do
+      line_has_prefix "$line" "$prefix" || printf '%s\n' "$line" >> "$tmp"
+    done < "$GLOBAL_SELECTIONS_FILE"
+  fi
+  
+  # Add new selections
+  for track in "${new_tracks[@]}"; do
+    [[ -n "$track" ]] && printf '%s\n' "$prefix$track" >> "$tmp"
+  done
+  mv "$tmp" "$GLOBAL_SELECTIONS_FILE"
+}
+
+# Clear all selections
+clear_all_selections() {
+  : > "$GLOBAL_SELECTIONS_FILE"
+}
+
+queue_count() {
+  if [[ -s "$GLOBAL_SELECTIONS_FILE" ]]; then
+    wc -l < "$GLOBAL_SELECTIONS_FILE"
+  else
+    printf '0\n'
+  fi
+}
+
+queue_is_empty() {
+  [[ ! -s "$GLOBAL_SELECTIONS_FILE" ]]
+}
+
+truncate_for_preview() {
+  local text="$1"
+  local max_len="${2:-38}"
+  if (( ${#text} <= max_len )); then
+    printf '%s' "$text"
+  else
+    printf '%s…' "${text:0:max_len-1}"
+  fi
+}
+
+print_preview_box_title() {
+  local title="$1"
+  echo "  ${C_OUTLINE}╭─────────────────────────────────╮${ANSI_RESET}"
+  printf "  ${C_OUTLINE}│${ANSI_RESET} ${C_PRIMARY}${ANSI_BOLD}%-31s${ANSI_RESET} ${C_OUTLINE}│${ANSI_RESET}\n" "$title"
+  echo "  ${C_OUTLINE}╰─────────────────────────────────╯${ANSI_RESET}"
+}
+
+print_preview_divider() {
+  echo "  ${C_OUTLINE}──────────────────────────────────${ANSI_RESET}"
+}
+
+queue_render_preview() {
+  local title="${1:-Current Queue}"
+  local limit="${2:-20}"
+  local count=0
+
+  count=$(queue_count)
+
+  echo ""
+  print_preview_box_title "QUEUE"
+  echo ""
+  echo "  ${C_PRIMARY}${ANSI_BOLD}● ${title}${ANSI_RESET}"
+  print_preview_divider
+  echo "  ${C_MUTED}Total queued:${ANSI_RESET} ${C_FG}${ANSI_BOLD}$count${ANSI_RESET}"
+  echo ""
+
+  if [[ "$count" -eq 0 ]]; then
+    echo "  ${C_MUTED}(Queue is empty)${ANSI_RESET}"
+    return 0
+  fi
+
+  local i=0
+  while IFS= read -r line; do
+    [[ -n "$line" ]] || continue
+    i=$((i + 1))
+    local display="$line"
+    if line_has_prefix "$line" "$MUSIC_DIR/"; then
+      display="${line#"$MUSIC_DIR/"}"
+    fi
+    display="$(truncate_for_preview "$display" 36)"
+    printf "  ${C_SECONDARY}%2d.${ANSI_RESET} ${C_FG}%s${ANSI_RESET}\n" "$i" "$display"
+    [[ "$i" -ge "$limit" ]] && break
+  done < "$GLOBAL_SELECTIONS_FILE"
+
+  if [[ "$count" -gt "$limit" ]]; then
+    echo ""
+    echo "  ${C_MUTED}... and $((count - limit)) more${ANSI_RESET}"
+  fi
+}
+
+### ============================
+### HELPER FUNCTIONS
+### ============================
+
+list_tracks() {
+  local album_dir="$1"
+  [[ -d "$album_dir" ]] || return 0
+  find "$album_dir" -maxdepth 1 -type f \( -iname "*.flac" -o -iname "*.wav" \) -printf '%f\n' 2>/dev/null | LC_ALL=C sort || true
+}
+
+count_non_album_selections() {
+  local album="$1"
+  local prefix="$MUSIC_DIR/$album/"
+  local count=0
+
+  [[ -s "$GLOBAL_SELECTIONS_FILE" ]] || {
+    printf '0'
+    return 0
+  }
+
+  while IFS= read -r line; do
+    if ! line_has_prefix "$line" "$prefix"; then
+      count=$((count + 1))
+    fi
+  done < "$GLOBAL_SELECTIONS_FILE"
+  printf '%d' "$count"
+}
+
+preflight_checks() {
+  local log_dir
+  log_dir="$(dirname -- "$LOG")"
+  mkdir -p "$log_dir" || die "Cannot create log directory: $log_dir"
+
+  require_cmd "$FZF" "fzf"
+  require_cmd "$MPV" "mpv"
+
+  [[ -d "$MUSIC_DIR" ]] || die "Music directory does not exist: $MUSIC_DIR"
+  [[ -r "$MUSIC_DIR" ]] || die "Music directory is not readable: $MUSIC_DIR"
+}
+
+# Common fzf options for consistent styling
+FZF_BASE_OPTS=(
+  --height=100%
+  --border=none
+  --margin=0
+  --padding=0,1
+  --layout=reverse
+  --ansi
+  --cycle
+  --scrollbar='▐'
+  --pointer='❯ '
+  --marker='● '
+)
+
+# Get album info preview
+get_album_preview() {
+  local album="$1"
+  local track_count
+  local first_track=""
+  
+  # Count tracks
+  track_count=$(list_tracks "$MUSIC_DIR/$album" | wc -l)
+  
+  # Get first track for metadata
+  first_track=$(find "$MUSIC_DIR/$album" -maxdepth 1 -type f \( -iname "*.flac" -o -iname "*.wav" \) -print -quit 2>/dev/null || true)
+  
+  # Build preview
+  echo ""
+  print_preview_box_title "ALBUM INFO"
+  echo ""
+  echo "  ${C_YELLOW}${ANSI_BOLD}◉${ANSI_RESET} ${C_FG}${ANSI_BOLD}$album${ANSI_RESET}"
+  print_preview_divider
+  echo ""
+  echo "    ${C_BLUE}◦${ANSI_RESET}  ${C_MUTED}Tracks:${ANSI_RESET}  ${C_FG}$track_count${ANSI_RESET}"
+  
+  if [[ -n "$first_track" ]] && [[ -n "$MEDIAINFO" ]]; then
+    # Get album artist if available
+    local artist
+    artist=$("$MEDIAINFO" --Inform="General;%Album/Performer%" "$first_track" 2>/dev/null || echo "")
+    if [[ -n "$artist" ]]; then
+      echo "    ${C_PRIMARY}◉${ANSI_RESET}  ${C_MUTED}Artist:${ANSI_RESET}  ${C_FG}$artist${ANSI_RESET}"
+    fi
+    
+    # Get album name from metadata
+    local album_name
+    album_name=$("$MEDIAINFO" --Inform="General;%Album%" "$first_track" 2>/dev/null || echo "")
+    if [[ -n "$album_name" ]]; then
+      echo "    ${C_PRIMARY}◎${ANSI_RESET}  ${C_MUTED}Album:${ANSI_RESET}   ${C_FG}$album_name${ANSI_RESET}"
+    fi
+    
+    # Get year
+    local year
+    year=$("$MEDIAINFO" --Inform="General;%Recorded_Date%" "$first_track" 2>/dev/null || echo "")
+    if [[ -n "$year" ]]; then
+      echo "    ${C_PRIMARY}◷${ANSI_RESET}  ${C_MUTED}Year:${ANSI_RESET}    ${C_FG}${year:0:4}${ANSI_RESET}"
+    fi
+    
+    # Get format info
+    local format
+    format=$("$MEDIAINFO" --Inform="Audio;%Format% %BitDepth%bit/%SamplingRate%Hz" "$first_track" 2>/dev/null || echo "")
+    if [[ -n "$format" ]]; then
+      echo "    ${C_PRIMARY}◌${ANSI_RESET}  ${C_MUTED}Format:${ANSI_RESET}  ${C_FG}$format${ANSI_RESET}"
+    fi
+  fi
+  
+  echo ""
+  print_preview_divider
+  echo ""
+  echo "  ${C_SECONDARY}ENTER plays the full album${ANSI_RESET}"
+}
+
+# Get track info preview  
+get_track_preview() {
+  local track="$1"
+  local album="$2"
+  local full_path="$MUSIC_DIR/$album/$track"
+  
+  echo ""
+  print_preview_box_title "TRACK INFO"
+  echo ""
+  echo "  ${C_BLUE}${ANSI_BOLD}♪${ANSI_RESET} ${C_FG}${ANSI_BOLD}${track%.flac}${ANSI_RESET}"
+  print_preview_divider
+  echo ""
+  
+  if [[ -f "$full_path" ]] && [[ -n "$MEDIAINFO" ]]; then
+    # Get track title
+    local title
+    title=$("$MEDIAINFO" --Inform="General;%Track%" "$full_path" 2>/dev/null || echo "")
+    if [[ -n "$title" ]]; then
+      echo "    ${C_PRIMARY}◦${ANSI_RESET}  ${C_MUTED}Title:${ANSI_RESET}    ${C_FG}$title${ANSI_RESET}"
+    fi
+    
+    # Get duration
+    local duration
+    duration=$("$MEDIAINFO" --Inform="General;%Duration/String3%" "$full_path" 2>/dev/null || echo "")
+    if [[ -n "$duration" ]]; then
+      echo "    ${C_PRIMARY}◷${ANSI_RESET}  ${C_MUTED}Duration:${ANSI_RESET} ${C_FG}$duration${ANSI_RESET}"
+    fi
+    
+    # Get track number
+    local track_num
+    track_num=$("$MEDIAINFO" --Inform="General;%Track/Position%" "$full_path" 2>/dev/null || echo "")
+    if [[ -n "$track_num" ]]; then
+      echo "    ${C_PRIMARY}#${ANSI_RESET}  ${C_MUTED}Track:${ANSI_RESET}    ${C_FG}$track_num${ANSI_RESET}"
+    fi
+    
+    # Get format info
+    local format
+    format=$("$MEDIAINFO" --Inform="Audio;%Format% %BitDepth%bit/%SamplingRate%Hz" "$full_path" 2>/dev/null || echo "")
+    if [[ -n "$format" ]]; then
+      echo "    ${C_PRIMARY}◌${ANSI_RESET}  ${C_MUTED}Format:${ANSI_RESET}   ${C_FG}$format${ANSI_RESET}"
+    fi
+    
+    # Get bitrate
+    local bitrate
+    bitrate=$("$MEDIAINFO" --Inform="Audio;%BitRate/String%" "$full_path" 2>/dev/null || echo "")
+    if [[ -n "$bitrate" ]]; then
+      echo "    ${C_PRIMARY}▤${ANSI_RESET}  ${C_MUTED}Bitrate:${ANSI_RESET}  ${C_FG}$bitrate${ANSI_RESET}"
+    fi
+  fi
+  
+  echo ""
+  print_preview_divider
+  echo ""
+  echo "  ${C_SECONDARY}TAB mark/unmark${ANSI_RESET} ${C_MUTED}|${ANSI_RESET} ${C_SECONDARY}ENTER done album${ANSI_RESET}"
+}
+
+effective_queue_for_album_selection() {
+  local album="$1"
+  shift
+  local prefix="$MUSIC_DIR/$album/"
+  local -A seen=()
+
+  if [[ -s "$GLOBAL_SELECTIONS_FILE" ]]; then
+    while IFS= read -r line; do
+      [[ -n "$line" ]] || continue
+      if ! line_has_prefix "$line" "$prefix"; then
+        printf '%s\n' "$line"
+        seen["$line"]=1
+      fi
+    done < "$GLOBAL_SELECTIONS_FILE"
+  fi
+
+  local track
+  for track in "$@"; do
+    [[ -n "$track" ]] || continue
+    local full="$prefix$track"
+    if [[ -z "${seen[$full]:-}" ]]; then
+      printf '%s\n' "$full"
+      seen["$full"]=1
+    fi
+  done
+}
+
+get_track_queue_preview() {
+  local album="$1"
+  local track="$2"
+  shift 2
+
+  local -a effective_queue=()
+  mapfile -t effective_queue < <(effective_queue_for_album_selection "$album" "$@")
+
+  echo ""
+  print_preview_box_title "QUEUE (PENDING VIEW)"
+  echo ""
+  echo "  ${C_MUTED}Album:${ANSI_RESET} ${C_FG}$album${ANSI_RESET}"
+  echo "  ${C_MUTED}Effective queued:${ANSI_RESET} ${C_FG}${ANSI_BOLD}${#effective_queue[@]}${ANSI_RESET}"
+  print_preview_divider
+  echo ""
+
+  if [[ ${#effective_queue[@]} -eq 0 ]]; then
+    echo "  ${C_MUTED}(Queue is empty)${ANSI_RESET}"
+  else
+    local idx=0
+    local item
+    for item in "${effective_queue[@]}"; do
+      idx=$((idx + 1))
+      local display="$item"
+      if line_has_prefix "$item" "$MUSIC_DIR/"; then
+        display="${item#"$MUSIC_DIR/"}"
+      fi
+      display="$(truncate_for_preview "$display" 36)"
+      printf "  ${C_SECONDARY}%2d.${ANSI_RESET} ${C_FG}%s${ANSI_RESET}\n" "$idx" "$display"
+      [[ "$idx" -ge 18 ]] && break
+    done
+    if [[ ${#effective_queue[@]} -gt 18 ]]; then
+      echo ""
+      echo "  ${C_MUTED}... and $((${#effective_queue[@]} - 18)) more${ANSI_RESET}"
+    fi
+  fi
+
+  echo ""
+  print_preview_divider
+  get_track_preview "$track" "$album"
+}
+
+select_mode() {
+  local left_label
+  local right_label
+  if [[ "$UI_VARIANT" == "quiet" ]]; then
+    left_label="${C_SECONDARY}${ANSI_BOLD}  ◉ Browse Albums${ANSI_RESET}  ${C_MUTED}· play full albums${ANSI_RESET}"
+    right_label="${C_MUTED}${ANSI_BOLD}  ◎ Select Songs${ANSI_RESET}   ${C_MUTED}· build a custom queue${ANSI_RESET}"
+  else
+    left_label="${C_PRIMARY}${ANSI_BOLD}  ◉ Browse Albums${ANSI_RESET}  ${C_MUTED}· play full albums${ANSI_RESET}"
+    right_label="${C_TERTIARY}${ANSI_BOLD}  ◎ Select Songs${ANSI_RESET}   ${C_MUTED}· build a custom queue${ANSI_RESET}"
+  fi
+
+  printf '%b\n' \
+    "$left_label" \
+    "$right_label" | \
+    "$FZF" "${FZF_BASE_OPTS[@]}" \
+           --color="$FZF_COLORS" \
+           --header=$'Choose a mode\n' \
+           --header-first \
+           --prompt=" ❯ " \
+           --info=hidden \
+           --no-scrollbar
+}
+
+select_album() {
+  local mode="${1:-albums}"
+  local preview_cmd='item={1}; "$FLACMENU_SCRIPT" --preview-album-item "$item"'
+  local header=$'📀 Select Album\n'
+  local -a extra_binds=()
+  local qcount=0
+  local album_style="${C_FG}${ANSI_BOLD}"
+  local count_style="${C_TERTIARY}${ANSI_BOLD}"
+
+  if [[ "$UI_VARIANT" == "quiet" ]]; then
+    album_style="$C_FG"
+    count_style="$C_MUTED"
+  elif [[ "$UI_VARIANT" == "high" ]]; then
+    album_style="${C_PRIMARY}${ANSI_BOLD}"
+    count_style="${C_SUCCESS}${ANSI_BOLD}"
+  fi
+
+  if [[ "$mode" == "songs" ]]; then
+    qcount=$(queue_count)
+    header=$'Albums\nenter open\nctrl-p play queue | ctrl-l clear\n'
+    extra_binds=(
+      --bind='ctrl-p:become(echo __PLAY_QUEUE__)'
+      --bind='ctrl-l:become(echo __CLEAR_QUEUE__)'
+    )
+  else
+    header=$'Albums\nenter play album | ctrl-o preview\n'
+  fi
+
+  local fzf_output
+  fzf_output=$(
+    {
+      if [[ "$mode" == "songs" ]]; then
+        printf '__PLAY_QUEUE__\t%b▶%b %bPlay Queue%b %b(%s)%b\n' "${C_SUCCESS}${ANSI_BOLD}" "$ANSI_RESET" "${C_SUCCESS}" "$ANSI_RESET" "$C_MUTED" "$qcount" "$ANSI_RESET"
+        printf '__CLEAR_QUEUE__\t%b✕%b %bClear Queue%b\n' "${C_ERROR}${ANSI_BOLD}" "$ANSI_RESET" "${C_ERROR}" "$ANSI_RESET"
+      fi
+
+      find . -maxdepth 1 -type d ! -name '.' -printf '%T@ %f\n' | \
+        sort -rn | \
+        cut -d' ' -f2- | \
+        while IFS= read -r dir; do
+          local count
+          count=$(list_tracks "$dir" | wc -l)
+          if [[ "$count" -gt 0 ]]; then
+            printf '%s\t%b%s%b  %b•%b  %b%d%b %btracks%b\n' \
+              "$dir" \
+              "$album_style" "$dir" "$ANSI_RESET" \
+              "$C_MUTED" "$ANSI_RESET" \
+              "$count_style" "$count" "$ANSI_RESET" \
+              "$C_MUTED" "$ANSI_RESET"
+          fi
+        done
+    } | \
+      "$FZF" "${FZF_BASE_OPTS[@]}" \
+             --color="$FZF_COLORS" \
+             --header="$header" \
+             --header-first \
+             --prompt=" ❯ " \
+             --delimiter=$'\t' \
+             --with-nth=2 \
+             --preview="$preview_cmd" \
+             --preview-window="right:45%:wrap:border-left" \
+             --border-label=" ALBUMS · ${UI_LABEL} " \
+             --border-label-pos=2 \
+             --bind="ctrl-o:toggle-preview" \
+             --bind='backward-eof:become(echo __BACK__)' \
+             "${extra_binds[@]}" \
+             --info="inline: "
+  ) || true
+
+  if [[ "$fzf_output" == "__BACK__" ]]; then
+    echo "__BACK__"
+  else
+    printf '%s' "$fzf_output" | cut -f1
+  fi
+}
+
+select_songs_from_album() {
+  local album="$1"
+  
+  # Get sorted track list
+  local -a track_list
+  mapfile -t track_list < <(list_tracks "$album")
+  [[ ${#track_list[@]} -gt 0 ]] || {
+    log_msg "No tracks found in album: $album"
+    echo "__BACK__"
+    return 0
+  }
+  
+  # Get pre-selected tracks for this album
+  local -a preselected
+  mapfile -t preselected < <(get_album_selections "$album")
+
+  # Build display list with tab-separated fields: display<TAB>track
+  local -a display_list=()
+  local track
+  for track in "${track_list[@]}"; do
+    local styled
+    printf -v styled '%b%s%b' "$C_FG" "$track" "$ANSI_RESET"
+    display_list+=("$styled"$'\t'"$track")
+  done
+
+  # Build position-based toggle commands for pre-selection
+  local start_bind=""
+  if [[ ${#preselected[@]} -gt 0 ]]; then
+    local -a toggle_cmds=()
+    local presel
+    for presel in "${preselected[@]}"; do
+      [[ -z "$presel" ]] && continue
+      local pos=1
+      for track in "${track_list[@]}"; do
+        if [[ "$track" == "$presel" ]]; then
+          toggle_cmds+=("pos($pos)" "toggle")
+          break
+        fi
+        pos=$((pos + 1))
+      done
+    done
+    if [[ ${#toggle_cmds[@]} -gt 0 ]]; then
+      start_bind=$(IFS=+; echo "${toggle_cmds[*]}")
+    fi
+  fi
+
+  local -a start_opt=()
+  if [[ -n "$start_bind" ]]; then
+    start_opt=(--bind "start:${start_bind}")
+  fi
+
+  local other_count=0
+  other_count=$(count_non_album_selections "$album")
+  local initial_count=$((other_count + ${#preselected[@]}))
+  local initial_label="  Queued: $initial_count  "
+
+  export FLACMENU_PREVIEW_ALBUM="$album"
+  local preview_cmd="\"$FLACMENU_SCRIPT\" --preview-track-queue \"\$FLACMENU_PREVIEW_ALBUM\" {2} {+2}"
+
+  local fzf_output
+  fzf_output=$(printf '%s\n' "${display_list[@]}" | \
+    nl -w2 -s$'\t' | \
+    "$FZF" "${FZF_BASE_OPTS[@]}" \
+           --color="$FZF_COLORS" \
+           --header=$'Track Picker\n'"$album"$'\nenter done | tab mark\nctrl-p play queue | ctrl-l clear\n' \
+           --header-first \
+           --prompt=" ❯ " \
+           --delimiter=$'\t' \
+           --with-nth=2 \
+           --multi \
+           --border=bottom \
+           --border-label="$initial_label" \
+           --border-label-pos=bottom \
+           --preview="$preview_cmd" \
+           --preview-window="right:45%:wrap:border-left" \
+           --bind='tab:toggle+down+transform-border-label:n=$(('$other_count' + {+n})); echo "  Queued: $n  "' \
+           --bind='shift-tab:toggle+up+transform-border-label:n=$(('$other_count' + {+n})); echo "  Queued: $n  "' \
+           --bind='ctrl-a:select-all+transform-border-label:n=$(('$other_count' + {+n})); echo "  Queued: $n  "' \
+           --bind='ctrl-d:deselect-all+transform-border-label:n=$(('$other_count' + {+n})); echo "  Queued: $n  "' \
+           --bind='ctrl-l:become(echo __CLEAR__)' \
+           --bind='ctrl-p:become(echo __PLAY__)' \
+           --bind='backward-eof:become(echo __BACK__)' \
+           "${start_opt[@]}" \
+           --info="inline: ") || true
+
+  if [[ "$fzf_output" == "__BACK__" ]] || [[ "$fzf_output" == "__CLEAR__" ]] || [[ "$fzf_output" == "__PLAY__" ]]; then
+    echo "$fzf_output"
+  else
+    echo "$fzf_output" | cut -f2
+  fi
+}
+
+play_or_queue() {
+  local -a tracks=("$@")
+
+  [[ ${#tracks[@]} -gt 0 ]] || return 0
+
+  # Append to existing mpv instance when IPC socket is available.
+  if pgrep -x mpv >/dev/null 2>&1 && [[ -S "$SOCKET" ]] && [[ -n "$SOCAT" ]]; then
+    for p in "${tracks[@]}"; do
+      local escaped
+      escaped=$(printf '%s' "$p" | sed ':a;N;$!ba;s/\n/\\n/g; s/\\/\\\\/g; s/"/\\"/g')
+      printf 'loadfile "%s" append-play\n' "$escaped" | "$SOCAT" - "$SOCKET" >/dev/null 2>&1 || {
+        log_msg "Failed to queue track over IPC socket: $p"
+      }
+    done
+    return 0
+  fi
+
+  # Launch a fresh mpv instance.
+  local -a cmd=("$MPV" --no-terminal "--input-ipc-server=$SOCKET" --title="flacmenu-mpv" --)
+  cmd+=("${tracks[@]}")
+
+  if [[ -n "$HYPRCTL" ]]; then
+    local hypr_cmd
+    printf -v hypr_cmd '%q ' "${cmd[@]}"
+    "$HYPRCTL" dispatch exec -- "${hypr_cmd% }" || {
+      nohup setsid "${cmd[@]}" >/tmp/mpv-flacmenu.out 2>/tmp/mpv-flacmenu.err &
+    }
+  else
+    nohup setsid "${cmd[@]}" >/tmp/mpv-flacmenu.out 2>/tmp/mpv-flacmenu.err &
+  fi
+}
+
+### ============================
+### MAIN FLOW (State Machine)
+### ============================
+
+# Handle preview commands (called by fzf --preview) - must be before cd
+if [[ "${1:-}" == "--preview-album" ]]; then
+  shift
+  album="$*"
+  if [[ -n "$album" ]]; then
+    get_album_preview "$album"
+  fi
+  exit 0
+fi
+
+if [[ "${1:-}" == "--preview-album-item" ]]; then
+  shift
+  item="${1:-}"
+  case "$item" in
+    __PLAY_QUEUE__)
+      queue_render_preview "Play queue action" 24
+      echo ""
+      echo "  ${C_SECONDARY}Press ENTER or ctrl-p to play queued songs.${ANSI_RESET}"
+      ;;
+    __CLEAR_QUEUE__)
+      queue_render_preview "Clear queue action" 24
+      echo ""
+      echo "  ${C_SECONDARY}Press ENTER or ctrl-l to clear the queue.${ANSI_RESET}"
+      ;;
+    *)
+      if [[ -n "$item" ]]; then
+        get_album_preview "$item"
+      fi
+      ;;
+  esac
+  exit 0
+fi
+
+if [[ "${1:-}" == "--preview-track" ]]; then
+  shift
+  track="${1:-}"
+  album="${2:-}"
+  if [[ -n "$track" ]] && [[ -n "$album" ]]; then
+    get_track_preview "$track" "$album"
+  fi
+  exit 0
+fi
+
+if [[ "${1:-}" == "--preview-track-queue" ]]; then
+  shift
+  album="${1:-}"
+  track="${2:-}"
+  shift 2 || true
+  if [[ -n "$track" ]] && [[ -n "$album" ]]; then
+    get_track_queue_preview "$album" "$track" "$@"
+  fi
+  exit 0
+fi
+
+# Runtime checks for interactive mode
+preflight_checks
 {
   echo
   echo "====== flacmenu $(date) ======"
@@ -24,147 +873,130 @@ mkdir -p "$ALBUMART_CACHE"
   echo "Socket: $SOCKET"
 } >> "$LOG"
 
+# Change to music directory for main operations
 cd "$MUSIC_DIR"
 
-### ============================
-### HELPER FUNCTIONS
-### ============================
+# State machine for navigation
+# States: 0=mode, 1=album, 2=tracks
+state=0
+mode=""
+ALBUM=""
 
-select_mode() {
-  printf '%s\n' "📀 Albums" "🎵 Songs" | \
-    "$FZF" --height=90% --border=rounded --margin=1,2 --padding=1,2 \
-           --prompt="Select mode > " \
-           --layout=reverse \
-           --ansi
-}
+while true; do
+  case $state in
+    0)  # Mode selection
+        result=$(select_mode)
+        
+        # Empty result means Escape pressed or no selection
+        if [[ -z "$result" ]]; then
+          exit 0
+        fi
+        
+        # Determine mode from selection
+        if [[ "$result" == *"Albums"* ]]; then
+          mode="albums"
+        else
+          mode="songs"
+        fi
+        state=1
+        ;;
+        
+    1)  # Album selection
+        result=$(select_album "$mode") || true
+        
+        # Check for back navigation
+        if [[ "$result" == "__BACK__" ]]; then
+          state=0
+          continue
+        fi
 
-select_album() {
-  # List directories only, sorted by modification time (newest first)
-  find . -maxdepth 1 -type d ! -name '.' -printf '%T@ %f\n' | \
-    sort -rn | \
-    cut -d' ' -f2- | \
-    "$FZF" --height=90% --border=rounded --margin=1,2 --padding=1,2 \
-           --prompt="Select album > " \
-           --layout=reverse \
-           --ansi
-}
+        if [[ "$mode" == "songs" ]] && [[ "$result" == "__PLAY_QUEUE__" ]]; then
+          if ! queue_is_empty; then
+            mapfile -t ALL_TRACKS < "$GLOBAL_SELECTIONS_FILE"
+            play_or_queue "${ALL_TRACKS[@]}"
+            exit 0
+          fi
+          continue
+        fi
 
-select_songs_from_album() {
-  local album="$1"
-  # List tracks in album, sorted by filename
-  find "$album" -maxdepth 1 -type f \( -iname "*.flac" -o -iname "*.wav" \) -printf '%f\n' | \
-    sort | \
-    sed 's|^|🎵 |' | \
-    "$FZF" --height=90% --border=rounded --margin=1,2 --padding=1,2 \
-           --prompt="Select tracks (TAB to multi-select) > " \
-           --multi \
-           --layout=reverse \
-           --bind='tab:toggle+down' \
-           --ansi
-}
-
-play_or_queue() {
-  local -a tracks=("$@")
-  
-  # append if mpv running
-  if pgrep -x mpv >/dev/null 2>&1 && [ -S "$SOCKET" ] && [ -n "$SOCAT" ]; then
-    for p in "${tracks[@]}"; do
-      printf 'loadfile "%s" append-play\n' "$p" | $SOCAT - "$SOCKET"
-    done
-    exit 0
-  fi
-
-  # otherwise launch mpv with playlist
-  PLAYLIST="/tmp/flacmenu_playlist_$$.m3u"
-  : > "$PLAYLIST"
-  for p in "${tracks[@]}"; do
-    echo "$p" >> "$PLAYLIST"
-  done
-
-  CMD="$MPV --no-terminal --input-ipc-server=$SOCKET --playlist=$PLAYLIST"
-
-  if [ -n "$HYPRCTL" ]; then
-    hyprctl dispatch exec "$CMD" || {
-      nohup setsid $CMD >/tmp/mpv-flacmenu.out 2>/tmp/mpv-flacmenu.err &
-    }
-  else
-    nohup setsid $CMD >/tmp/mpv-flacmenu.out 2>/tmp/mpv-flacmenu.err &
-  fi
-}
-
-### ============================
-### MAIN FLOW
-### ============================
-
-# Step 1: Select mode (Albums or Songs)
-MODE=$(select_mode)
-
-if [ -z "${MODE:-}" ]; then
-  echo "Nothing selected." >> "$LOG"
-  exit 0
-fi
-
-case "$MODE" in
-  "📀 Albums")
-    # Step 2a: Select an album
-    ALBUM=$(select_album)
-    
-    if [ -z "${ALBUM:-}" ]; then
-      echo "No album selected." >> "$LOG"
-      exit 0
-    fi
-    
-    # Step 3a: Get all tracks in album, sorted by filename
-    mapfile -t TRACKS < <(find "$ALBUM" -maxdepth 1 -type f \( -iname "*.flac" -o -iname "*.wav" \) -printf '%f\n' | sort)
-    
-    if [ ${#TRACKS[@]} -eq 0 ]; then
-      echo "No tracks found in album." >> "$LOG"
-      exit 0
-    fi
-    
-    # Build absolute paths
-    ABS_LIST=()
-    for track in "${TRACKS[@]}"; do
-      ABS_LIST+=("$MUSIC_DIR/$ALBUM/$track")
-    done
-    
-    play_or_queue "${ABS_LIST[@]}"
-    ;;
-    
-  "🎵 Songs")
-    # Step 2b: Select an album first
-    ALBUM=$(select_album)
-    
-    if [ -z "${ALBUM:-}" ]; then
-      echo "No album selected." >> "$LOG"
-      exit 0
-    fi
-    
-    # Step 3b: Select songs from that album (multi-select)
-    SELECTED=$(select_songs_from_album "$ALBUM")
-    
-    if [ -z "${SELECTED:-}" ]; then
-      echo "No songs selected." >> "$LOG"
-      exit 0
-    fi
-    
-    # Parse selection and build absolute paths
-    IFS=$'\n' read -rd '' -a SELECTED_ARRAY < <(printf '%s\n' "$SELECTED" && printf '\0')
-    
-    ABS_LIST=()
-    for item in "${SELECTED_ARRAY[@]}"; do
-      # Remove the emoji prefix
-      cleaned="${item#🎵 }"
-      ABS_LIST+=("$MUSIC_DIR/$ALBUM/$cleaned")
-    done
-    
-    play_or_queue "${ABS_LIST[@]}"
-    ;;
-    
-  *)
-    echo "Invalid mode selected." >> "$LOG"
-    exit 1
-    ;;
-esac
-
-exit 0
+        if [[ "$mode" == "songs" ]] && [[ "$result" == "__CLEAR_QUEUE__" ]]; then
+          clear_all_selections
+          continue
+        fi
+        
+        # Empty result means Escape pressed
+        if [[ -z "$result" ]]; then
+          exit 0
+        fi
+        
+        ALBUM="$result"
+        
+        if [[ "$mode" == "albums" ]]; then
+          # Play entire album and exit
+          mapfile -t TRACKS < <(list_tracks "$ALBUM")
+          
+          if [[ ${#TRACKS[@]} -eq 0 ]]; then
+            log_msg "No tracks found in album: $ALBUM"
+            exit 0
+          fi
+          
+          ABS_LIST=()
+          for track in "${TRACKS[@]}"; do
+            ABS_LIST+=("$MUSIC_DIR/$ALBUM/$track")
+          done
+          
+          play_or_queue "${ABS_LIST[@]}"
+          exit 0
+        else
+          # Songs mode - go to track selection
+          state=2
+        fi
+        ;;
+        
+    2)  # Track selection (songs mode only)
+        result=$(select_songs_from_album "$ALBUM")
+        
+        # Handle special actions
+        case "$result" in
+          __BACK__)
+            # Go back without changing selections for this album
+            state=1
+            continue
+            ;;
+          __CLEAR__)
+            # Clear all selections, return to album list
+            clear_all_selections
+            state=1
+            continue
+            ;;
+          __PLAY__)
+            # Play all global selections
+            if [[ -s "$GLOBAL_SELECTIONS_FILE" ]]; then
+              mapfile -t ALL_TRACKS < "$GLOBAL_SELECTIONS_FILE"
+              play_or_queue "${ALL_TRACKS[@]}"
+              exit 0
+            fi
+            # Keep selecting if queue is empty
+            state=2
+            continue
+            ;;
+          "")
+            # Escape pressed - exit cleanly
+            exit 0
+            ;;
+          *)
+            # Sync this album's selections to global store
+            mapfile -t SELECTED_TRACKS <<< "$result"
+            sync_album_selections "$ALBUM" "${SELECTED_TRACKS[@]}"
+            # Return to album selection to continue adding
+            state=1
+            ;;
+        esac
+        ;;
+        
+    *)
+        log_msg "Invalid state: $state"
+        exit 1
+        ;;
+  esac
+done

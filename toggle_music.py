@@ -51,9 +51,39 @@ def move_client_to_workspace(client, workspace):
     if client:
         dispatch_hyprctl("movetoworkspacesilent", f"special:{workspace},address:{client['address']}")
 
+def client_workspace_name(client):
+    """Get a client's workspace name safely"""
+    workspace = client.get("workspace")
+    if isinstance(workspace, dict):
+        return workspace.get("name", "")
+    return ""
+
+def is_flacmenu_music_client(client):
+    """Check if client belongs to flacmenu/mpv session in special:music"""
+    ws_name = client_workspace_name(client)
+    if ws_name != "special:music":
+        return False
+
+    title = (client.get("title") or "").lower()
+    initial_title = (client.get("initialTitle") or "").lower()
+
+    return (
+        "flacmenu" in title
+        or "flacmenu" in initial_title
+        or "flacmenu-mpv" in title
+        or "flacmenu-mpv" in initial_title
+    )
+
 def toggle_music_workspace():
     """Main function to toggle music workspace"""
     clients = get_clients()
+
+    # If flacmenu/mpv session is already in the music workspace, just toggle visibility.
+    flacmenu_client = find_client(clients, is_flacmenu_music_client)
+    if flacmenu_client:
+        print("Toggling music workspace for flacmenu/mpv session...")
+        dispatch_hyprctl("togglespecialworkspace", "music")
+        return
     
     # Check if Cider is running
     cider_client = find_client(clients, lambda c: 
